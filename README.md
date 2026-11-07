@@ -30,17 +30,22 @@ Open `CalendarCleanupApp/CalendarCleanup.xcodeproj` in Xcode, choose your team u
 
 ## Publish a release
 
-This requires a Developer ID Application certificate and a saved notarization login:
+Pushing a tag like `v1.2.0` builds, signs and notarizes the app, then publishes it as a GitHub release:
 
 ```bash
-xcrun notarytool store-credentials calendar-cleanup
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
-Update `MARKETING_VERSION` in the Xcode project, then run:
+### Required repository secrets
 
-```bash
-./scripts/release.sh
-```
+| Secret | Value |
+|---|---|
+| `DEVELOPER_ID_CERTIFICATE_P12` | Your Developer ID Application certificate, exported as `.p12` and base64-encoded |
+| `DEVELOPER_ID_CERTIFICATE_PASSWORD` | The password you set when exporting the `.p12` |
+| `NOTARY_KEY_P8` | An App Store Connect API key (`.p8`), base64-encoded |
+| `NOTARY_KEY_ID` | That API key's ID |
+| `NOTARY_ISSUER_ID` | Your App Store Connect issuer ID |
 
 ## Command-line tool
 
