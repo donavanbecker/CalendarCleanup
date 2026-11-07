@@ -117,7 +117,8 @@ final class Cleaner: ObservableObject {
 
     private let store = EKEventStore()
     private var lastRequest: ScanRequest?
-    private var didAutoClean = false
+    /// Whether this launch has already cleaned up (or skipped it).
+    private(set) var didAutoClean = false
 
     private static let undoFile: URL = {
         let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -427,25 +428,39 @@ struct CalendarCleanupApp: App {
     }
 
     private var mainWindow: some Scene {
+        #if os(macOS)
         Window("Calendar Cleanup", id: "main") {
-            ContentView()
-                .environmentObject(cleaner)
-                .frame(minWidth: 860, minHeight: 560)
-                .task {
-                    #if DEBUG
-                    if UserDefaults.standard.bool(forKey: "screenshotDemo") {
-                        cleaner.loadScreenshotDemo()
-                        return
-                    }
-                    #endif
-                    await cleaner.requestAccess()
-                }
+            rootView.frame(minWidth: 860, minHeight: 560)
         }
+        #else
+        WindowGroup {
+            rootView
+        }
+        #endif
+    }
+
+    private var rootView: some View {
+        ContentView()
+            .environmentObject(cleaner)
+            .task {
+                #if DEBUG
+                if UserDefaults.standard.bool(forKey: "screenshotDemo") {
+                    cleaner.loadScreenshotDemo()
+                    return
+                }
+                #endif
+                await cleaner.requestAccess()
+            }
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var cleaner: Cleaner
+    @Environment(\.openURL) private var openURL
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var isShowingResults = false
+    #endif
 
     var body: some View {
         switch cleaner.access {
@@ -456,27 +471,150 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("Calendar Access Is Off", systemImage: "calendar.badge.exclamationmark")
             } description: {
+                #if os(macOS)
                 Text("Turn on Calendar Cleanup in Privacy & Security, then reopen the app.")
+                #else
+                Text("In Settings, give Calendar Cleanup full access to your calendars, then reopen the app.")
+                #endif
             } actions: {
                 Button("Open Privacy Settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
-                        NSWorkspace.shared.open(url)
-                    }
+                    #if os(macOS)
+                    let link = "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"
+                    #else
+                    let link = UIApplication.openSettingsURLString
+                    #endif
+                    if let url = URL(string: link) { openURL(url) }
                 }
             }
         case .granted:
-            NavigationSplitView {
-                SettingsPane()
-                    .navigationSplitViewColumnWidth(min: 300, ideal: 330, max: 400)
-            } detail: {
-                ResultsPane()
+            #if os(iOS)
+            if sizeClass == .compact {
+                // iPhone: settings first, then the results on their own screen.
+                NavigationStack {
+                    SettingsPane(showResults: { isShowingResults = true })
+                        .navigationTitle("Calendar Cleanup")
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) { UndoButton(compact: true) }
+                        }
+                        .navigationDestination(isPresented: $isShowingResults) { ResultsPane() }
+                }
+                #if DEBUG
+                // Screenshot mode: `-screenshotResults YES` opens the results screen.
+                .onAppear {
+                    if UserDefaults.standard.bool(forKey: "screenshotResults") { isShowingResults = true }
+                }
+                #endif
+            } else {
+                splitView
+            }
+            #else
+            splitView
+            #endif
+        }
+    }
+
+    private var splitView: some View {
+        NavigationSplitView {
+            SettingsPane()
+                .navigationSplitViewColumnWidth(min: 300, ideal: 330, max: 400)
+                #if os(iOS)
+                .navigationTitle("Calendar Cleanup")
+                #endif
+        } detail: {
+            ResultsPane()
+        }
+    }
+}
+
+/// Puts back the events removed most recently, after asking.
+struct UndoButton: View {
+    @EnvironmentObject private var cleaner: Cleaner
+    var compact = false
+    @State private var isConfirming = false
+
+    var body: some View {
+        if !cleaner.lastRemoval.isEmpty {
+            Button(compact ? "Undo" : "Undo Last Removal (\(cleaner.lastRemoval.count))…") {
+                isConfirming = true
+            }
+            .help("Puts back the events removed most recently.")
+            .disabled(cleaner.isBusy)
+            .confirmationDialog(
+                "Put back \(cleaner.lastRemoval.count) removed events?",
+                isPresented: $isConfirming,
+                titleVisibility: .visible
+            ) {
+                Button("Put Back \(cleaner.lastRemoval.count) Events") {
+                    Task { await cleaner.undoLastRemoval() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("They're added back to their calendars and sync to everyone who uses them. A removed date of a repeating event comes back as a single event.")
             }
         }
     }
 }
 
+extension View {
+    /// Checkboxes on the Mac; on iPhone and iPad, a check circle you tap.
+    func checkboxToggle() -> some View {
+        #if os(macOS)
+        toggleStyle(.checkbox)
+        #else
+        toggleStyle(CheckCircleToggleStyle())
+        #endif
+    }
+
+    /// Keeps each button in a form row separately tappable on iPhone and iPad.
+    func separateRowButtons() -> some View {
+        #if os(macOS)
+        self
+        #else
+        buttonStyle(.borderless)
+        #endif
+    }
+}
+
+#if os(iOS)
+struct CheckCircleToggleStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            HStack {
+                Image(systemName: configuration.isOn ? "checkmark.circle.fill" : "circle")
+                    .imageScale(.large)
+                    .foregroundStyle(configuration.isOn ? Color.accentColor : Color.secondary)
+                configuration.label
+                    .foregroundStyle(Color.primary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(configuration.isOn ? .isSelected : [])
+    }
+}
+#endif
+
+struct CSVFile: FileDocument {
+    static var readableContentTypes: [UTType] { [.commaSeparatedText] }
+    let text: String
+
+    init(text: String) { self.text = text }
+
+    init(configuration: ReadConfiguration) throws {
+        text = String(decoding: configuration.file.regularFileContents ?? Data(), as: UTF8.self)
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
+    }
+}
+
 struct SettingsPane: View {
     @EnvironmentObject private var cleaner: Cleaner
+    /// Shows the results, on iPhone where they're on their own screen.
+    var showResults: () -> Void = {}
 
     @AppStorage("calendarIDs") private var calendarIDsText = ""
     @AppStorage("keywords") private var keywordsText = ""
@@ -520,12 +658,14 @@ struct SettingsPane: View {
                                         .lineLimit(1)
                                 }
                                 .help("Remove \(keyword)")
+                                .separateRowButtons()
                             }
                         }
                     }
                     HStack {
                         ForEach(["Birthday", "Anniversary"].filter { !keywords.contains($0) }, id: \.self) { suggestion in
                             Button("+ \(suggestion)") { addKeyword(suggestion) }
+                                .separateRowButtons()
                         }
                     }
                     Text(keywords.isEmpty
@@ -538,7 +678,7 @@ struct SettingsPane: View {
                 Section("Calendars to clean") {
                     ForEach(cleaner.calendars.filter(\.allowsContentModifications), id: \.calendarIdentifier) { calendar in
                         Toggle(calendar.title, isOn: calendarBinding(calendar.calendarIdentifier))
-                            .toggleStyle(.checkbox)
+                            .checkboxToggle()
                     }
                     Text("Read-only calendars aren't listed because their events can't be removed.")
                         .font(.caption)
@@ -594,6 +734,7 @@ struct SettingsPane: View {
                     Text(problem).font(.caption).foregroundStyle(.secondary)
                 }
                 Button {
+                    showResults()
                     Task { await cleaner.scan(makeRequest()) }
                 } label: {
                     Text("Find Duplicates").frame(maxWidth: .infinity)
@@ -608,7 +749,9 @@ struct SettingsPane: View {
             // Values saved by older versions could be out of range.
             if clampDays(daysBack) != daysBack { daysBack = clampDays(daysBack) }
             if clampDays(daysAhead) != daysAhead { daysAhead = clampDays(daysAhead) }
-            guard cleanOnLaunch else { return }
+            // This view can reappear (on iPhone, when you go back to it), so only once per launch.
+            guard cleanOnLaunch, !cleaner.didAutoClean else { return }
+            showResults()
             if let problem {
                 cleaner.skipAutoClean(because: problem)
             } else {
@@ -664,6 +807,10 @@ struct DayField: View {
         TextField(title, text: $text)
             .labelsHidden()
             .frame(width: 60)
+            #if os(iOS)
+            .keyboardType(.numberPad)
+            .multilineTextAlignment(.trailing)
+            #endif
             .focused($isFocused)
             .onAppear { text = String(days) }
             .onChange(of: days) { _, newDays in
@@ -692,7 +839,21 @@ struct DayField: View {
 struct ResultsPane: View {
     @EnvironmentObject private var cleaner: Cleaner
     @State private var isConfirming = false
-    @State private var isConfirmingUndo = false
+    @State private var isExporting = false
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    #endif
+
+    private var exportFileName: String {
+        "Calendar Duplicates \(Date().formatted(.iso8601.year().month().day())).csv"
+    }
+
+    private var removeButton: some View {
+        Button("Remove \(cleaner.selectedEventCount) Events…", role: .destructive) {
+            isConfirming = true
+        }
+        .disabled(cleaner.selectedEventCount == 0 || cleaner.isBusy)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -716,34 +877,32 @@ struct ResultsPane: View {
                 results
             }
         }
+        #if os(macOS)
         .navigationTitle("Calendar Cleanup")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if !cleaner.lastRemoval.isEmpty {
-                    Button("Undo Last Removal (\(cleaner.lastRemoval.count))…") {
-                        isConfirmingUndo = true
-                    }
-                    .help("Puts back the events removed most recently.")
-                    .disabled(cleaner.isBusy)
-                    .confirmationDialog(
-                        "Put back \(cleaner.lastRemoval.count) removed events?",
-                        isPresented: $isConfirmingUndo,
-                        titleVisibility: .visible
-                    ) {
-                        Button("Put Back \(cleaner.lastRemoval.count) Events") {
-                            Task { await cleaner.undoLastRemoval() }
-                        }
-                        Button("Cancel", role: .cancel) {}
-                    } message: {
-                        Text("They're added back to their calendars and sync to everyone who uses them. A removed date of a repeating event comes back as a single event.")
-                    }
-                }
-                Button("Remove \(cleaner.selectedEventCount) Events…", role: .destructive) {
-                    isConfirming = true
-                }
-                .disabled(cleaner.selectedEventCount == 0 || cleaner.isBusy)
+                UndoButton()
+                removeButton
             }
         }
+        #else
+        .navigationTitle("Duplicates")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) { UndoButton(compact: true) }
+            ToolbarItem(placement: .bottomBar) { removeButton.buttonStyle(.borderedProminent) }
+        }
+        .fileExporter(
+            isPresented: $isExporting,
+            document: CSVFile(text: cleaner.csv()),
+            contentType: .commaSeparatedText,
+            defaultFilename: exportFileName
+        ) { result in
+            if case .failure(let error) = result {
+                cleaner.errorMessage = "The list couldn't be saved: \(error.localizedDescription)"
+            }
+        }
+        #endif
         .confirmationDialog(
             "Remove \(cleaner.selectedEventCount) events?",
             isPresented: $isConfirming,
@@ -785,43 +944,82 @@ struct ResultsPane: View {
                     }
                 }
                 Spacer()
+                #if os(macOS)
                 Button("Export CSV…", action: exportCSV)
-                Button("Select All") { cleaner.selected = Set(cleaner.findings.map(\.id)) }
-                Button("Select None") { cleaner.selected = [] }
+                selectButtons
+                #else
+                Menu {
+                    selectButtons
+                    Button("Export CSV…", systemImage: "square.and.arrow.up") { isExporting = true }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle").labelStyle(.iconOnly)
+                }
+                #endif
             }
             .padding(12)
             Divider()
             List(cleaner.findings) { finding in
                 Toggle(isOn: selectionBinding(finding.id)) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(finding.title).lineLimit(1)
+                    #if os(iOS)
+                    if sizeClass == .compact {
+                        // iPhone: stacked, so nothing gets cut off.
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(finding.title)
+                            Text("\(finding.start.formatted(dateFormat(finding))) · \(finding.events.count) to remove")
+                                .font(.subheadline)
+                                .monospacedDigit()
                             Text("\(finding.calendarTitle) · \(finding.reason)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .lineLimit(1)
                         }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Text(finding.start, format: finding.isAllDay
-                                 ? .dateTime.month(.abbreviated).day().year()
-                                 : .dateTime.month(.abbreviated).day().year().hour().minute())
-                                .monospacedDigit()
-                            Text("\(finding.events.count) to remove")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    } else {
+                        wideRow(finding)
                     }
+                    #else
+                    wideRow(finding)
+                    #endif
                 }
-                .toggleStyle(.checkbox)
+                .checkboxToggle()
             }
         }
     }
 
+    private func dateFormat(_ finding: Finding) -> Date.FormatStyle {
+        finding.isAllDay
+            ? .dateTime.month(.abbreviated).day().year()
+            : .dateTime.month(.abbreviated).day().year().hour().minute()
+    }
+
+    private func wideRow(_ finding: Finding) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(finding.title).lineLimit(1)
+                Text("\(finding.calendarTitle) · \(finding.reason)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(finding.start, format: dateFormat(finding))
+                    .monospacedDigit()
+                Text("\(finding.events.count) to remove")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private var selectButtons: some View {
+        Button("Select All") { cleaner.selected = Set(cleaner.findings.map(\.id)) }
+        Button("Select None") { cleaner.selected = [] }
+    }
+
+    #if os(macOS)
     private func exportCSV() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.commaSeparatedText]
-        panel.nameFieldStringValue = "Calendar Duplicates \(Date().formatted(.iso8601.year().month().day())).csv"
+        panel.nameFieldStringValue = exportFileName
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try cleaner.csv().write(to: url, atomically: true, encoding: .utf8)
@@ -829,6 +1027,7 @@ struct ResultsPane: View {
             cleaner.errorMessage = "The list couldn't be saved: \(error.localizedDescription)"
         }
     }
+    #endif
 
     private func selectionBinding(_ id: UUID) -> Binding<Bool> {
         Binding(
@@ -916,6 +1115,8 @@ extension Cleaner {
         defaults.set(false, forKey: "cleanOnLaunch")
         access = .granted
 
+        // On iPhone and iPad, take screenshots with `xcrun simctl io booted screenshot`.
+        #if os(macOS)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             guard let window = NSApp.windows.first(where: { $0.isVisible }) else { return }
             window.setFrame(NSRect(x: 80, y: 80, width: 1440, height: 900), display: true)
@@ -928,6 +1129,7 @@ extension Cleaner {
                 try? image.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
             }
         }
+        #endif
     }
 }
 #endif

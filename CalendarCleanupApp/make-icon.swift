@@ -1,5 +1,7 @@
 // Draws the Calendar Cleanup icon: a duplicate calendar page fading behind a checked one.
-// Usage: make-icon <output.png>  (writes a 1024 x 1024 image)
+// Usage: make-icon <output.png> [ios]  (writes a 1024 x 1024 image)
+// With "ios", the background fills the whole square and the image has no
+// transparency, as iOS requires; iOS rounds the corners itself.
 
 import AppKit
 
@@ -18,6 +20,8 @@ func page(_ rect: NSRect, header: NSColor, body: NSColor) {
     NSGraphicsContext.restoreGraphicsState()
 }
 
+let isIOS = CommandLine.arguments.dropFirst(2).first == "ios"
+
 let image = NSBitmapImageRep(
     bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024,
     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -26,8 +30,15 @@ let image = NSBitmapImageRep(
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: image)
 
 // Background: the standard macOS icon shape, inset from the 1024 canvas.
+// For iOS, everything is scaled up so the tile fills the canvas.
 let tile = NSRect(x: 100, y: 100, width: 824, height: 824)
-let tileShape = NSBezierPath(roundedRect: tile, xRadius: 185, yRadius: 185)
+if isIOS {
+    let fill = NSAffineTransform()
+    fill.scale(by: 1024 / tile.width)
+    fill.translateX(by: -tile.minX, yBy: -tile.minY)
+    fill.concat()
+}
+let tileShape = isIOS ? NSBezierPath(rect: tile) : NSBezierPath(roundedRect: tile, xRadius: 185, yRadius: 185)
 NSGraphicsContext.saveGraphicsState()
 tileShape.addClip()
 NSGradient(starting: color(38, 130, 240, 1), ending: color(22, 72, 170, 1))!.draw(in: tile, angle: -90)
@@ -71,4 +82,15 @@ color(35, 170, 95, 1).setStroke()
 check.stroke()
 
 NSGraphicsContext.current = nil
-try! image.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+let output = URL(fileURLWithPath: CommandLine.arguments[1])
+if isIOS {
+    // Every pixel is already opaque; this writes the file without an alpha channel.
+    let opaque = CGContext(
+        data: nil, width: 1024, height: 1024, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+    )!
+    opaque.draw(image.cgImage!, in: CGRect(x: 0, y: 0, width: 1024, height: 1024))
+    try! NSBitmapImageRep(cgImage: opaque.makeImage()!).representation(using: .png, properties: [:])!.write(to: output)
+} else {
+    try! image.representation(using: .png, properties: [:])!.write(to: output)
+}
