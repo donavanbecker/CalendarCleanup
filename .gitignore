@@ -1,0 +1,8 @@
+.DS_Store
+*.app
+*.xcarchive
+xcuserdata/
+DerivedData/
+build/
+dist/
+CalendarDedupe/calendar-dedupe
