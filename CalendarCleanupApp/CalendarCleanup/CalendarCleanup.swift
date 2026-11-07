@@ -6,7 +6,9 @@
 // The last removal is saved so it can be undone, and the list can be exported as CSV.
 
 import EventKit
+#if canImport(Sparkle)
 import Sparkle
+#endif
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -376,6 +378,9 @@ final class Cleaner: ObservableObject {
     }
 }
 
+// The direct-download build updates itself with Sparkle. The App Store build
+// has no Sparkle, because the App Store handles its updates.
+#if canImport(Sparkle)
 @MainActor
 final class UpdateAvailability: ObservableObject {
     @Published var canCheck = false
@@ -399,24 +404,34 @@ struct CheckForUpdatesButton: View {
             .disabled(!availability.canCheck)
     }
 }
+#endif
 
 @main
 struct CalendarCleanupApp: App {
     @StateObject private var cleaner = Cleaner()
+    #if canImport(Sparkle)
     private let updaterController = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    #endif
 
     var body: some Scene {
+        #if canImport(Sparkle)
+        mainWindow.commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: updaterController.updater)
+            }
+        }
+        #else
+        mainWindow
+        #endif
+    }
+
+    private var mainWindow: some Scene {
         Window("Calendar Cleanup", id: "main") {
             ContentView()
                 .environmentObject(cleaner)
                 .frame(minWidth: 860, minHeight: 560)
                 .task { await cleaner.requestAccess() }
-        }
-        .commands {
-            CommandGroup(after: .appInfo) {
-                CheckForUpdatesButton(updater: updaterController.updater)
-            }
         }
     }
 }
