@@ -41,7 +41,7 @@
 	<key>SUEnableInstallerLauncherService</key>
 	<true/>
 	<key>SUFeedURL</key>
-	<string>https://github.com/donavanbecker/calendar-cleanup/releases/latest/download/appcast.xml</string>
+	<string>https://github.com/donavanbecker/CalendarCleanup/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>E8xybBMXHHwQ+xwscWoXcfdSshw2orL+luQ/+5Y9CVk=</string>
 </dict>

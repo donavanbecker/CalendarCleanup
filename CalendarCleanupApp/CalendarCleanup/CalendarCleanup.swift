@@ -3,10 +3,12 @@
 //
 // Only single occurrences are removed, never a whole repeating series.
 // Events with attendees are never removed, because that can notify other people.
+// The last removal is saved so it can be undone, and the list can be exported as CSV.
 
 import EventKit
 import Sparkle
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct EventKey: Hashable {
     let title: String
@@ -26,10 +28,62 @@ struct Finding: Identifiable {
     let id = UUID()
     let title: String
     let start: Date
+    let end: Date
     let isAllDay: Bool
     let calendarTitle: String
     let reason: String
     let events: [EKEvent]
+}
+
+/// A removed event, saved so Undo can put it back. A removed date of a repeating
+/// event comes back as a single event, because a series can't be re-joined.
+struct RemovedEvent: Codable {
+    struct Alarm: Codable {
+        let offset: TimeInterval
+        let date: Date?
+    }
+
+    let calendarID: String
+    let title: String?
+    let start: Date
+    let end: Date
+    let isAllDay: Bool
+    let timeZone: String?
+    let location: String?
+    let notes: String?
+    let url: URL?
+    let availability: Int
+    let alarms: [Alarm]
+
+    init(_ event: EKEvent) {
+        calendarID = event.calendar.calendarIdentifier
+        title = event.title
+        start = event.startDate
+        end = event.endDate
+        isAllDay = event.isAllDay
+        timeZone = event.timeZone?.identifier
+        location = event.location
+        notes = event.notes
+        url = event.url
+        availability = event.availability.rawValue
+        alarms = (event.alarms ?? []).map { Alarm(offset: $0.relativeOffset, date: $0.absoluteDate) }
+    }
+
+    func makeEvent(in store: EKEventStore, calendar: EKCalendar) -> EKEvent {
+        let event = EKEvent(eventStore: store)
+        event.calendar = calendar
+        event.title = title
+        event.isAllDay = isAllDay
+        event.timeZone = timeZone.flatMap(TimeZone.init(identifier:))
+        event.startDate = start
+        event.endDate = end
+        event.location = location
+        event.notes = notes
+        event.url = url
+        event.availability = EKEventAvailability(rawValue: availability) ?? .notSupported
+        event.alarms = alarms.map { $0.date.map(EKAlarm.init(absoluteDate:)) ?? EKAlarm(relativeOffset: $0.offset) }
+        return event
+    }
 }
 
 struct ScanRequest {
@@ -56,8 +110,24 @@ final class Cleaner: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusMessage: String?
 
+    /// The events removed most recently, kept on disk until undone or replaced.
+    @Published private(set) var lastRemoval: [RemovedEvent] = []
+
     private let store = EKEventStore()
     private var lastRequest: ScanRequest?
+    private var didAutoClean = false
+
+    private static let undoFile: URL = {
+        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return folder.appendingPathComponent("Last Removal.json")
+    }()
+
+    init() {
+        if let data = try? Data(contentsOf: Self.undoFile),
+           let saved = try? JSONDecoder().decode([RemovedEvent].self, from: data) {
+            lastRemoval = saved
+        }
+    }
 
     var selectedEventCount: Int {
         findings.filter { selected.contains($0.id) }.reduce(0) { $0 + $1.events.count }
@@ -65,12 +135,113 @@ final class Cleaner: ObservableObject {
 
     func requestAccess() async {
         let granted = (try? await store.requestFullAccessToEvents()) ?? false
-        access = granted ? .granted : .denied
         if granted {
             calendars = store.calendars(for: .event).sorted {
                 $0.title.localizedStandardCompare($1.title) == .orderedAscending
             }
         }
+        access = granted ? .granted : .denied
+    }
+
+    /// Scans with the saved settings and removes everything found, once per launch.
+    func autoClean(_ request: ScanRequest) async {
+        guard !didAutoClean else { return }
+        didAutoClean = true
+        await scan(request)
+        if selectedEventCount == 0 {
+            statusMessage = "Cleaned up on open: no duplicates found."
+        } else {
+            await removeSelected(onLaunch: true)
+        }
+    }
+
+    func skipAutoClean(because problem: String) {
+        guard !didAutoClean else { return }
+        didAutoClean = true
+        statusMessage = "Didn't clean up on open: \(problem)"
+    }
+
+    private func saveUndo(_ events: [RemovedEvent]) throws {
+        if events.isEmpty {
+            try? FileManager.default.removeItem(at: Self.undoFile)
+            return
+        }
+        try FileManager.default.createDirectory(
+            at: Self.undoFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(events).write(to: Self.undoFile, options: .atomic)
+    }
+
+    func undoLastRemoval() async {
+        isBusy = true
+        errorMessage = nil
+        statusMessage = nil
+        try? await Task.sleep(for: .milliseconds(50))
+
+        var restored = 0
+        var missing = 0
+        do {
+            for saved in lastRemoval {
+                guard let calendar = store.calendar(withIdentifier: saved.calendarID),
+                      calendar.allowsContentModifications else {
+                    missing += 1
+                    continue
+                }
+                try store.save(saved.makeEvent(in: store, calendar: calendar), span: .thisEvent, commit: false)
+                restored += 1
+            }
+            try store.commit()
+        } catch {
+            store.reset()
+            errorMessage = "Nothing was put back: \(error.localizedDescription)"
+            isBusy = false
+            return
+        }
+        lastRemoval = []
+        try? saveUndo([])
+        var status = "Put back \(restored) \(restored == 1 ? "event" : "events")."
+        if missing > 0 {
+            status += " \(missing) couldn't be put back because their calendar is gone or read-only."
+        }
+        statusMessage = status
+        if let request = lastRequest {
+            await scan(request, keepStatus: true)
+        } else {
+            isBusy = false
+        }
+    }
+
+    /// The found duplicates as CSV, one row per event and date.
+    func csv() -> String {
+        let dateTime = DateFormatter()
+        dateTime.dateFormat = "yyyy-MM-dd HH:mm"
+        let dateOnly = DateFormatter()
+        dateOnly.dateFormat = "yyyy-MM-dd"
+
+        func field(_ text: String) -> String {
+            // A leading = + - or @ could run as a formula in a spreadsheet.
+            var text = text
+            if let first = text.first, "=+-@".contains(first) { text = "'" + text }
+            if text.contains(where: { ",\"\n\r".contains($0) }) {
+                return "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+            }
+            return text
+        }
+
+        var lines = ["Selected,Calendar,Title,Start,End,All Day,Reason,Copies to Remove"]
+        for finding in findings {
+            let format = finding.isAllDay ? dateOnly : dateTime
+            lines.append([
+                selected.contains(finding.id) ? "Yes" : "No",
+                finding.calendarTitle,
+                finding.title,
+                format.string(from: finding.start),
+                format.string(from: finding.end),
+                finding.isAllDay ? "Yes" : "No",
+                finding.reason,
+                String(finding.events.count),
+            ].map(field).joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 
     func scan(_ request: ScanRequest, keepStatus: Bool = false) async {
@@ -138,30 +309,40 @@ final class Cleaner: ObservableObject {
         hasScanned = true
     }
 
-    func removeSelected() async {
+    func removeSelected(onLaunch: Bool = false) async {
         guard let request = lastRequest else { return }
         isBusy = true
         errorMessage = nil
         statusMessage = nil
         try? await Task.sleep(for: .milliseconds(50))
 
-        var removed = 0
+        let events = findings.filter { selected.contains($0.id) }.flatMap(\.events)
+        let snapshot = events.map(RemovedEvent.init)
+        // Save the undo copy first, so nothing is removed that can't be put back.
         do {
-            for finding in findings where selected.contains(finding.id) {
-                for event in finding.events {
-                    try store.remove(event, span: .thisEvent, commit: false)
-                    removed += 1
-                }
+            try saveUndo(snapshot)
+        } catch {
+            errorMessage = "Nothing was removed: the undo copy couldn't be saved. \(error.localizedDescription)"
+            isBusy = false
+            return
+        }
+
+        do {
+            for event in events {
+                try store.remove(event, span: .thisEvent, commit: false)
             }
             try store.commit()
         } catch {
-            // Nothing was saved, so drop the pending changes.
+            // Nothing was saved, so drop the pending changes and keep the earlier undo copy.
             store.reset()
+            try? saveUndo(lastRemoval)
             errorMessage = "Nothing was removed: \(error.localizedDescription) Scan again and retry."
             isBusy = false
             return
         }
-        statusMessage = "Removed \(removed) \(removed == 1 ? "event" : "events")."
+        lastRemoval = snapshot
+        let removed = "removed \(events.count) \(events.count == 1 ? "event" : "events")."
+        statusMessage = onLaunch ? "Cleaned up on open: \(removed)" : removed.prefix(1).uppercased() + removed.dropFirst()
         await scan(request, keepStatus: true)
     }
 
@@ -185,6 +366,7 @@ final class Cleaner: ObservableObject {
             Finding(
                 title: key.title.isEmpty ? "(No title)" : key.title,
                 start: key.start,
+                end: key.end,
                 isAllDay: key.isAllDay,
                 calendarTitle: calendar.title,
                 reason: reason,
@@ -280,7 +462,10 @@ struct SettingsPane: View {
     @AppStorage("removeSameCalendar") private var removeSameCalendar = true
     @AppStorage("useKeepCalendar") private var useKeepCalendar = false
     @AppStorage("keepCalendarID") private var keepCalendarID = ""
+    @AppStorage("cleanOnLaunch") private var cleanOnLaunch = false
     @State private var newKeyword = ""
+
+    static let dayRange = 0...1460
 
     private var selectedIDs: Set<String> { Set(calendarIDsText.split(separator: "\n").map(String.init)) }
     private var keywords: [String] { keywordsText.split(separator: "\n").map(String.init) }
@@ -288,7 +473,9 @@ struct SettingsPane: View {
     private var problem: String? {
         if selectedIDs.isEmpty { return "Choose at least one calendar." }
         if daysBack < 0 || daysAhead < 0 || daysBack + daysAhead == 0 { return "Choose a date range." }
-        if daysBack + daysAhead > 1460 { return "The date range can't be longer than 1,460 days." }
+        if daysBack + daysAhead > Self.dayRange.upperBound {
+            return "Days back and ahead can't add up to more than \(Self.dayRange.upperBound.formatted())."
+        }
         if !removeSameCalendar && !useKeepCalendar { return "Turn on at least one rule." }
         if useKeepCalendar && keepCalendarID.isEmpty { return "Choose the calendar to keep events on." }
         return nil
@@ -336,20 +523,26 @@ struct SettingsPane: View {
                 }
 
                 Section("Dates") {
-                    Stepper(value: $daysBack, in: 0...1460, step: 30) {
+                    Stepper(value: $daysBack, in: Self.dayRange, step: 30) {
                         LabeledContent("Days back") {
-                            TextField("Days back", value: $daysBack, format: .number)
-                                .labelsHidden()
-                                .frame(width: 60)
+                            DayField(title: "Days back", days: $daysBack, range: Self.dayRange)
                         }
                     }
-                    Stepper(value: $daysAhead, in: 0...1460, step: 30) {
+                    Stepper(value: $daysAhead, in: Self.dayRange, step: 30) {
                         LabeledContent("Days ahead") {
-                            TextField("Days ahead", value: $daysAhead, format: .number)
-                                .labelsHidden()
-                                .frame(width: 60)
+                            DayField(title: "Days ahead", days: $daysAhead, range: Self.dayRange)
                         }
                     }
+                    Text("Up to \(Self.dayRange.upperBound.formatted()) days in total.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("When the app opens") {
+                    Toggle("Clean up automatically", isOn: $cleanOnLaunch)
+                    Text("Finds duplicates with these settings and removes them without asking. You can undo the last removal.")
+                        .font(.caption)
+                        .foregroundStyle(cleanOnLaunch ? Color.orange : Color.secondary)
                 }
 
                 Section("Rules") {
@@ -388,6 +581,21 @@ struct SettingsPane: View {
             }
             .padding(12)
         }
+        .task {
+            // Values saved by older versions could be out of range.
+            if clampDays(daysBack) != daysBack { daysBack = clampDays(daysBack) }
+            if clampDays(daysAhead) != daysAhead { daysAhead = clampDays(daysAhead) }
+            guard cleanOnLaunch else { return }
+            if let problem {
+                cleaner.skipAutoClean(because: problem)
+            } else {
+                await cleaner.autoClean(makeRequest())
+            }
+        }
+    }
+
+    private func clampDays(_ days: Int) -> Int {
+        min(max(days, Self.dayRange.lowerBound), Self.dayRange.upperBound)
     }
 
     private func makeRequest() -> ScanRequest {
@@ -421,9 +629,47 @@ struct SettingsPane: View {
     }
 }
 
+/// A number field that accepts only digits and keeps the value within `range` as you type.
+struct DayField: View {
+    let title: String
+    @Binding var days: Int
+    let range: ClosedRange<Int>
+    @State private var text = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextField(title, text: $text)
+            .labelsHidden()
+            .frame(width: 60)
+            .focused($isFocused)
+            .onAppear { text = String(days) }
+            .onChange(of: days) { _, newDays in
+                if Int(text) != newDays { text = String(newDays) }
+            }
+            .onChange(of: text) { _, newText in
+                let digits = newText.filter(\.isASCII).filter(\.isNumber)
+                guard digits == newText else {
+                    text = digits
+                    return
+                }
+                guard let value = Int(digits.prefix(9)) else { return }
+                let limited = min(max(value, range.lowerBound), range.upperBound)
+                if days != limited { days = limited }
+                if limited != value || digits.count > 1 && digits.hasPrefix("0") {
+                    text = String(limited)
+                }
+            }
+            .onChange(of: isFocused) { _, focused in
+                if !focused { text = String(days) }
+            }
+            .onSubmit { text = String(days) }
+    }
+}
+
 struct ResultsPane: View {
     @EnvironmentObject private var cleaner: Cleaner
     @State private var isConfirming = false
+    @State private var isConfirmingUndo = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -449,7 +695,26 @@ struct ResultsPane: View {
         }
         .navigationTitle("Calendar Cleanup")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if !cleaner.lastRemoval.isEmpty {
+                    Button("Undo Last Removal (\(cleaner.lastRemoval.count))…") {
+                        isConfirmingUndo = true
+                    }
+                    .help("Puts back the events removed most recently.")
+                    .disabled(cleaner.isBusy)
+                    .confirmationDialog(
+                        "Put back \(cleaner.lastRemoval.count) removed events?",
+                        isPresented: $isConfirmingUndo,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Put Back \(cleaner.lastRemoval.count) Events") {
+                            Task { await cleaner.undoLastRemoval() }
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("They're added back to their calendars and sync to everyone who uses them. A removed date of a repeating event comes back as a single event.")
+                    }
+                }
                 Button("Remove \(cleaner.selectedEventCount) Events…", role: .destructive) {
                     isConfirming = true
                 }
@@ -466,7 +731,7 @@ struct ResultsPane: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This can't be undone. Changes sync to everyone who uses these calendars.")
+            Text("Changes sync to everyone who uses these calendars. You can put them back with Undo Last Removal until your next removal.")
         }
     }
 
@@ -497,6 +762,7 @@ struct ResultsPane: View {
                     }
                 }
                 Spacer()
+                Button("Export CSV…", action: exportCSV)
                 Button("Select All") { cleaner.selected = Set(cleaner.findings.map(\.id)) }
                 Button("Select None") { cleaner.selected = [] }
             }
@@ -526,6 +792,18 @@ struct ResultsPane: View {
                 }
                 .toggleStyle(.checkbox)
             }
+        }
+    }
+
+    private func exportCSV() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "Calendar Duplicates \(Date().formatted(.iso8601.year().month().day())).csv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try cleaner.csv().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            cleaner.errorMessage = "The list couldn't be saved: \(error.localizedDescription)"
         }
     }
 

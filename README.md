@@ -4,21 +4,23 @@ A Mac app that finds duplicate calendar events and removes the ones you confirm.
 
 ## Download
 
-Get the latest version from the [Releases page](https://github.com/donavanbecker/calendar-cleanup/releases/latest). Unzip it, move **Calendar Cleanup** to your Applications folder and open it. It needs macOS 14 or later, and it asks for calendar access the first time.
+Get the latest version from the [Releases page](https://github.com/donavanbecker/CalendarCleanup/releases/latest). Unzip it, move **Calendar Cleanup** to your Applications folder and open it. It needs macOS 14 or later, and it asks for calendar access the first time.
 
 The app checks for new versions on its own and installs them when you quit. You can also choose **Calendar Cleanup > Check for Updates…**.
 
 ## How it works
 
 1. Add keywords if you want to check only some events, such as "Birthday". With no keywords, every event is checked.
-2. Choose the calendars to clean and how far back and ahead to look.
+2. Choose the calendars to clean and how far back and ahead to look, up to 1,460 days in total.
 3. Choose the rules: remove duplicates on the same calendar, keep shared events on one calendar, or both.
-4. Click **Find Duplicates** and uncheck anything you want to keep.
+4. Click **Find Duplicates** and uncheck anything you want to keep. Click **Export CSV…** to save the list.
 5. Click **Remove … Events** and confirm.
 
 Events count as duplicates when their title, start, end and all-day setting all match.
 
-**Removals are permanent and sync to everyone who uses those calendars.**
+Removals sync to everyone who uses those calendars. To put the last removal back, click **Undo Last Removal**. It's available until your next removal, even after you quit. A removed date of a repeating event comes back as a single event.
+
+To clean up without asking, turn on **Clean up automatically** under **When the app opens**. Each time the app opens, it finds duplicates with your saved settings and removes them.
 
 - Events with attendees are never removed, because that can notify other people.
 - For a repeating event, only the matching date is removed, not the whole series.
