@@ -431,7 +431,15 @@ struct CalendarCleanupApp: App {
             ContentView()
                 .environmentObject(cleaner)
                 .frame(minWidth: 860, minHeight: 560)
-                .task { await cleaner.requestAccess() }
+                .task {
+                    #if DEBUG
+                    if UserDefaults.standard.bool(forKey: "screenshotDemo") {
+                        cleaner.loadScreenshotDemo()
+                        return
+                    }
+                    #endif
+                    await cleaner.requestAccess()
+                }
         }
     }
 }
@@ -831,3 +839,95 @@ struct ResultsPane: View {
         )
     }
 }
+
+#if DEBUG
+// Screenshot mode for App Store images, in debug builds only: run with
+// `-screenshotDemo YES`. It shows made-up calendars and duplicates held in
+// memory, and never reads or changes real calendars.
+extension Cleaner {
+    func loadScreenshotDemo() {
+        func calendar(_ title: String) -> EKCalendar {
+            let calendar = EKCalendar(for: .event, eventStore: store)
+            calendar.title = title
+            return calendar
+        }
+        let family = calendar("Family")
+        let home = calendar("Home")
+        let work = calendar("Work")
+        let kids = calendar("Kids' Activities")
+        let shared = calendar("Shared Birthdays")
+        calendars = [family, home, kids, shared, work]
+
+        let today = Calendar.current.startOfDay(for: Date())
+        func date(_ days: Int, _ hour: Int, _ minute: Int = 0) -> Date {
+            Calendar.current.date(byAdding: .minute, value: days * 1440 + hour * 60 + minute, to: today)!
+        }
+        func finding(_ title: String, _ on: EKCalendar, _ start: Date, hours: Double = 1,
+                     allDay: Bool = false, copies: Int, reason: String = "Duplicate on this calendar") -> Finding {
+            let end = allDay ? Calendar.current.date(byAdding: .day, value: 1, to: start)! : start.addingTimeInterval(hours * 3600)
+            let events = (0..<copies).map { _ in
+                let event = EKEvent(eventStore: store)
+                event.calendar = on
+                event.title = title
+                event.startDate = start
+                event.endDate = end
+                event.isAllDay = allDay
+                return event
+            }
+            return Finding(title: title, start: start, end: end, isAllDay: allDay,
+                           calendarTitle: on.title, reason: reason, events: events)
+        }
+
+        findings = [
+            finding("Soccer Practice", kids, date(2, 17, 30), hours: 1.5, copies: 2),
+            finding("Piano Lesson", kids, date(3, 16), copies: 1),
+            finding("Swim Meet", kids, date(9, 8), hours: 4, copies: 3),
+            finding("Grandma's Birthday", family, date(5, 0), allDay: true, copies: 1, reason: "Also on Shared Birthdays"),
+            finding("Dentist Appointment", family, date(6, 9, 30), copies: 1),
+            finding("Book Club", family, date(12, 19), hours: 2, copies: 2),
+            finding("Trash Pickup", home, date(1, 7), copies: 1),
+            finding("Furnace Service", home, date(15, 13), hours: 2, copies: 1),
+            finding("Team Standup", work, date(1, 9), hours: 0.25, copies: 4),
+            finding("Quarterly Planning", work, date(8, 10), hours: 3, copies: 1),
+        ].sorted { ($0.calendarTitle, $0.start, $0.title) < ($1.calendarTitle, $1.start, $1.title) }
+        selected = Set(findings.map(\.id))
+        selected.remove(findings.first { $0.title == "Quarterly Planning" }!.id)
+        scannedCount = 1284
+        hasScanned = true
+        lastRemoval = []
+
+        let defaults = UserDefaults.standard
+        if defaults.integer(forKey: "screenshotScene") == 2 {
+            // After a removal: nothing left to clean, with Undo available.
+            lastRemoval = findings.filter { selected.contains($0.id) }.flatMap(\.events).map(RemovedEvent.init)
+            statusMessage = "Removed \(lastRemoval.count) events."
+            findings = []
+            selected = []
+            scannedCount = 1268
+        }
+
+        defaults.set([family, home, kids, shared, work].map(\.calendarIdentifier).joined(separator: "\n"), forKey: "calendarIDs")
+        defaults.set("", forKey: "keywords")
+        defaults.set(90, forKey: "daysBack")
+        defaults.set(180, forKey: "daysAhead")
+        defaults.set(true, forKey: "removeSameCalendar")
+        defaults.set(true, forKey: "useKeepCalendar")
+        defaults.set(shared.calendarIdentifier, forKey: "keepCalendarID")
+        defaults.set(false, forKey: "cleanOnLaunch")
+        access = .granted
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard let window = NSApp.windows.first(where: { $0.isVisible }) else { return }
+            window.setFrame(NSRect(x: 80, y: 80, width: 1440, height: 900), display: true)
+            guard let path = defaults.string(forKey: "screenshotPath") else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                // The frame view includes the title bar and toolbar.
+                guard let view = window.contentView?.superview,
+                      let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+                view.cacheDisplay(in: view.bounds, to: image)
+                try? image.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+            }
+        }
+    }
+}
+#endif
