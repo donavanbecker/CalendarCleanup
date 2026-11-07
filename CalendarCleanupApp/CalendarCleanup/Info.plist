@@ -32,5 +32,17 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>Finds duplicate events on the calendars you choose and removes the ones you confirm.</string>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUEnableDownloaderService</key>
+	<true/>
+	<key>SUEnableInstallerLauncherService</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/donavanbecker/calendar-cleanup/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>E8xybBMXHHwQ+xwscWoXcfdSshw2orL+luQ/+5Y9CVk=</string>
 </dict>
 </plist>

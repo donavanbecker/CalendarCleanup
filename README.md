@@ -6,6 +6,8 @@ A Mac app that finds duplicate calendar events and removes the ones you confirm.
 
 Get the latest version from the [Releases page](https://github.com/donavanbecker/calendar-cleanup/releases/latest). Unzip it, move **Calendar Cleanup** to your Applications folder and open it. It needs macOS 14 or later, and it asks for calendar access the first time.
 
+The app checks for new versions on its own and installs them when you quit. You can also choose **Calendar Cleanup > Check for Updates…**.
+
 ## How it works
 
 1. Add keywords if you want to check only some events, such as "Birthday". With no keywords, every event is checked.
@@ -30,7 +32,7 @@ Open `CalendarCleanupApp/CalendarCleanup.xcodeproj` in Xcode, choose your team u
 
 ## Publish a release
 
-Pushing a tag like `v1.2.0` builds, signs and notarizes the app, then publishes it as a GitHub release:
+Pushing a tag like `v1.2.0` builds, signs and notarizes the app, then publishes it as a GitHub release with the signed `appcast.xml` that [Sparkle](https://sparkle-project.org) reads to offer the update:
 
 ```bash
 git tag v1.2.0
@@ -46,6 +48,9 @@ git push origin v1.2.0
 | `NOTARY_KEY_P8` | An App Store Connect API key (`.p8`), base64-encoded |
 | `NOTARY_KEY_ID` | That API key's ID |
 | `NOTARY_ISSUER_ID` | Your App Store Connect issuer ID |
+| `SPARKLE_PRIVATE_KEY` | The private update signing key. It's in the login Keychain under the Sparkle account `calendar-cleanup`, and `generate_keys --account calendar-cleanup -x <file>` exports it |
+
+Keep a safe backup of that key. Without it, you can't sign updates that existing copies of the app will accept.
 
 ## Command-line tool
 

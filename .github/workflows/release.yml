@@ -58,7 +58,21 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--timestamp" \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
-          echo "APP=$RUNNER_TEMP/build/Build/Products/Release/Calendar Cleanup.app" >> "$GITHUB_ENV"
+          APP="$RUNNER_TEMP/build/Build/Products/Release/Calendar Cleanup.app"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "SPARKLE_BIN=$RUNNER_TEMP/build/SourcePackages/artifacts/sparkle/Sparkle/bin" >> "$GITHUB_ENV"
+
+          # xcodebuild leaves Sparkle's nested helpers unsigned by us, and notarization
+          # needs them all under Developer ID. Sign from the inside out.
+          SIGN=(codesign --force --timestamp --options runtime --sign "Developer ID Application")
+          SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+          "${SIGN[@]}" "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+          "${SIGN[@]}" --preserve-metadata=entitlements "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+          "${SIGN[@]}" "$SPARKLE/Versions/B/Autoupdate"
+          "${SIGN[@]}" "$SPARKLE/Versions/B/Updater.app"
+          "${SIGN[@]}" "$SPARKLE"
+          "${SIGN[@]}" --preserve-metadata=entitlements "$APP"
+          codesign --verify --deep --strict "$APP"
 
       - name: Notarize
         env:
@@ -78,10 +92,22 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          ASSET="$RUNNER_TEMP/Calendar-Cleanup-$VERSION.zip"
-          ditto -c -k --keepParent "$APP" "$ASSET"
-          gh release create "$TAG" "$ASSET" --title "Calendar Cleanup $VERSION" --generate-notes
+          UPDATES="$RUNNER_TEMP/updates"
+          mkdir "$UPDATES"
+          ASSET="$UPDATES/Calendar-Cleanup-$VERSION.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ASSET"
+
+          # The app reads appcast.xml from the latest release to find new versions.
+          RELEASES="https://github.com/${GITHUB_REPOSITORY}/releases"
+          echo "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_BIN/generate_appcast" --ed-key-file - \
+            --download-url-prefix "$RELEASES/download/$TAG/" \
+            --full-release-notes-url "$RELEASES/tag/$TAG" \
+            -o "$RUNNER_TEMP/appcast.xml" "$UPDATES"
+
+          gh release create "$TAG" "$ASSET" "$RUNNER_TEMP/appcast.xml" \
+            --title "Calendar Cleanup $VERSION" --generate-notes
 
       - name: Remove signing material
         if: always()

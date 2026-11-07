@@ -5,6 +5,7 @@
 // Events with attendees are never removed, because that can notify other people.
 
 import EventKit
+import Sparkle
 import SwiftUI
 
 struct EventKey: Hashable {
@@ -193,9 +194,35 @@ final class Cleaner: ObservableObject {
     }
 }
 
+@MainActor
+final class UpdateAvailability: ObservableObject {
+    @Published var canCheck = false
+
+    init(updater: SPUUpdater) {
+        updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheck)
+    }
+}
+
+struct CheckForUpdatesButton: View {
+    let updater: SPUUpdater
+    @StateObject private var availability: UpdateAvailability
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        _availability = StateObject(wrappedValue: UpdateAvailability(updater: updater))
+    }
+
+    var body: some View {
+        Button("Check for Updates…") { updater.checkForUpdates() }
+            .disabled(!availability.canCheck)
+    }
+}
+
 @main
 struct CalendarCleanupApp: App {
     @StateObject private var cleaner = Cleaner()
+    private let updaterController = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     var body: some Scene {
         Window("Calendar Cleanup", id: "main") {
@@ -203,6 +230,11 @@ struct CalendarCleanupApp: App {
                 .environmentObject(cleaner)
                 .frame(minWidth: 860, minHeight: 560)
                 .task { await cleaner.requestAccess() }
+        }
+        .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: updaterController.updater)
+            }
         }
     }
 }
